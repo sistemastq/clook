@@ -5,61 +5,66 @@ import 'dotenv/config';
 import morgan from 'morgan';
 import cookieParser from 'cookie-parser';
 import crypto from 'crypto';
+import multer from 'multer';
+import { fileURLToPath } from 'url';
 import { supabase } from './supabaseClient.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 const port = process.env.PORT || 3000;
 
+// ───────────────────────────────────────────────────────────
+// Views y estáticos
+// ───────────────────────────────────────────────────────────
 app.set('view engine', 'ejs');
-app.set('views', path.join(process.cwd(), 'views'));
+app.set('views', path.join(__dirname, 'views'));
 
 app.use(morgan('dev'));
-app.use('/clook/gif', express.static(path.join(process.cwd(), 'gif')));
+app.use('/clook/gif', express.static(path.join(__dirname, 'gif')));
 app.use(cookieParser());
 app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
-app.use(express.static(path.join(process.cwd(), 'public'))); 
+// Sirve /public (incluye /public/private/private-link.html)
+app.use(express.static(path.join(__dirname, 'public')));
 
-// -------------------------------------------
+// Página privada SIN extensión ni carpeta: GET /private-link
+app.get('/private-link', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'private', 'private-link.html'));
+});
+
+// ───────────────────────────────────────────────────────────
 // Config
-// -------------------------------------------
+// ───────────────────────────────────────────────────────────
 app.set('trust proxy', true);
 
 const REMOVE_WWW = String(process.env.REMOVE_WWW || 'true') === 'true';
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 300000);
 const DEFAULT_LINK_FIELD = (process.env.DEFAULT_LINK_FIELD || 'instagram').toLowerCase();
-const SLUG_FORWARD_MODE = (process.env.SLUG_FORWARD_MODE || 'exact').toLowerCase(); // exact | append_path
-const BASE_PUBLIC_URL = (process.env.BASE_PUBLIC_URL || 'http://127.0.0.1:3000').replace(/\/+$/,'');
-
+const BASE_PUBLIC_URL = (process.env.BASE_PUBLIC_URL || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+const BUCKET = 'public-fotos'; // ← tu bucket
 const ALLOWED_FIELDS = new Set(['instagram', 'onlyfans', 'tiktok']);
 
-function normalizeHost(rawHostHeader = '') {
-  const host = String(rawHostHeader || '').toLowerCase().split(':')[0].trim();
-  if (!host) return '';
-  if (REMOVE_WWW && host.startsWith('www.')) return host.slice(4);
-  return host;
-}
 function getRealIp(req) {
   const fwd = req.headers['x-forwarded-for'];
   if (fwd) return fwd.split(',')[0].trim();
   return req.ip;
 }
 function isSafeHttpUrl(u) {
-  try {
-    const url = new URL(u);
-    return url.protocol === 'http:' || url.protocol === 'https:';
-  } catch {
-    return false;
-  }
+  try { const url = new URL(u); return url.protocol === 'http:' || url.protocol === 'https:'; }
+  catch { return false; }
 }
-// el link público apunta a /searchEngine/<slug>
-function computePublicUrl(slug) {
-  return `${BASE_PUBLIC_URL}/searchEngine/${slug}`;
+function computePublicUrlFromMode(slug, mode) {
+  const base = BASE_PUBLIC_URL; // ← toma tu dominio del .env (p.ej. https://securelinks.com)
+  if (mode === 'instructions') return `${base}/instructions/${slug}`;
+  return `${base}/searchEngine/${slug}`; // landing por defecto
 }
 
-// -------------------------------------------
+// ───────────────────────────────────────────────────────────
 // Test DB
-// -------------------------------------------
+// ───────────────────────────────────────────────────────────
 try {
   const { error: pingErr } = await supabase.from('links').select('id').limit(1);
   if (pingErr) console.error('Error conectando a Supabase:', pingErr.message);
@@ -68,10 +73,10 @@ try {
   console.error('Error conectando a Supabase:', e?.message || e);
 }
 
-// -------------------------------------------
-// Caché y helpers
-// -------------------------------------------
-const linksCache = new Map(); // key: link_id, value: { row, exp }
+// ───────────────────────────────────────────────────────────
+/** Caché simple de lecturas */
+// ───────────────────────────────────────────────────────────
+const linksCache = new Map(); // key: id, value: { val, exp }
 function cacheGet(map, key) {
   const hit = map.get(key);
   if (!hit) return null;
@@ -89,7 +94,7 @@ async function getLinks() {
     return {};
   }
   const links = {};
-  data.forEach(row => {
+  (data || []).forEach(row => {
     links[row.id] = {
       onlyfans: row.onlyfans,
       instagram: row.instagram,
@@ -116,52 +121,9 @@ async function getLinkRow(linkId) {
   return data || null;
 }
 
-// Garantiza que public_url esté creado/actualizado en DB
-async function ensurePublicUrlPersisted(slug) {
-  const desired = computePublicUrl(slug);
-
-  const { data: row, error } = await supabase
-    .from('links')
-    .select('public_url')
-    .eq('id', slug)
-    .maybeSingle();
-
-  if (error) {
-    console.error('ensurePublicUrlPersisted read error:', error.message);
-    return null;
-  }
-  if (row?.public_url === desired) return desired;
-
-  const { error: upErr } = await supabase
-    .from('links')
-    .update({ public_url: desired })
-    .eq('id', slug);
-
-  if (upErr) {
-    console.error('ensurePublicUrlPersisted update error:', upErr.message);
-    return row?.public_url || null;
-  }
-
-  linksCache.delete(slug);
-  return desired;
-}
-
-function buildForwardUrl(base, req, mode) {
-  if (!base) return '';
-  if (mode !== 'append_path') return base;
-  try {
-    const target = new URL(base);
-    const currentPath = req.originalUrl || req.url || '/';
-    const needsSlash = !target.pathname.endsWith('/') && !currentPath.startsWith('/');
-    const pathCombined = `${target.pathname}${needsSlash ? '/' : ''}${currentPath}`;
-    target.pathname = pathCombined;
-    return target.toString();
-  } catch { return ''; }
-}
-
-// -------------------------------------------
+// ───────────────────────────────────────────────────────────
 // Bot / UA / Rate limit (tu lógica original)
-// -------------------------------------------
+// ───────────────────────────────────────────────────────────
 const requestTimes = {};
 const MAX_REQUESTS = 50;
 const TIME_WINDOW = 60000;
@@ -181,7 +143,6 @@ function rateLimiter(req, res, next) {
   requestTimes[key].push(now);
   next();
 }
-
 function isSearchEngine(userAgent) {
   const bots = [
     'googlebot','bingbot','slurp','duckduckbot','baiduspider',
@@ -235,9 +196,9 @@ function isBot(req) {
   );
 }
 
-// -------------------------------------------
+// ───────────────────────────────────────────────────────────
 // Middlewares de sesión, rate-limit, captcha, honeypot
-// -------------------------------------------
+// ───────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   if (!req.cookies.sessionId) {
     const sessionId = crypto.randomBytes(16).toString('hex');
@@ -266,16 +227,80 @@ function honeypotMiddleware(req, res, next) {
 }
 app.use(honeypotMiddleware);
 
-// -------------------------------------------
-// ADMIN: Generador de link
-// -------------------------------------------
+// ───────────────────────────────────────────────────────────
+// ADMIN: Upload foto (solo al guardar) - legacy
+// ───────────────────────────────────────────────────────────
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } }); // 8MB
+
+app.post('/admin/upload-photo', upload.single('file'), async (req, res) => {
+  try {
+    const slug = String(req.body.slug || '').trim();
+    const file = req.file;
+    if (!/^[-A-Za-z0-9_]{3,}$/.test(slug)) {
+      return res.status(400).send('Slug inválido');
+    }
+    if (!file) return res.status(400).send('Archivo requerido');
+
+    const stamp = Date.now();
+    const safeName = (file.originalname || 'file').replace(/[^\w.\-]+/g, '_');
+    const objectKey = `${slug}/${stamp}-${safeName}`;
+
+    const { error: upErr } = await supabase.storage
+      .from(BUCKET)
+      .upload(objectKey, file.buffer, { contentType: file.mimetype, upsert: true });
+    if (upErr) {
+      console.error('storage upload error:', upErr.message);
+      return res.status(500).send('No se pudo subir');
+    }
+
+    const { data: pub } = supabase.storage.from(BUCKET).getPublicUrl(objectKey);
+    return res.json({ publicUrl: pub.publicUrl, path: objectKey });
+  } catch (e) {
+    console.error('upload-photo error:', e?.message || e);
+    return res.status(500).send('Error interno');
+  }
+});
+
+// ───────────────────────────────────────────────────────────
+// API moderna: Upload foto (FormData: file + slug)
+// ───────────────────────────────────────────────────────────
+app.post('/api/upload-photo', upload.single('file'), async (req, res) => {
+  try {
+    const slug = String(req.body.slug || '').trim();
+    const file = req.file;
+    if (!/^[-A-Za-z0-9_]{3,}$/.test(slug)) return res.status(400).json({ error: 'Slug inválido' });
+    if (!file) return res.status(400).json({ error: 'Archivo requerido' });
+
+    const stamp = Date.now();
+    const safeName = (file.originalname || 'file').replace(/[^\w.\-]+/g, '_');
+    const objectKey = `${slug}/${stamp}-${safeName}`;
+
+    const { error: upErr } = await supabase.storage
+      .from(BUCKET)
+      .upload(objectKey, file.buffer, { contentType: file.mimetype, upsert: true });
+    if (upErr) return res.status(500).json({ error: 'No se pudo subir', detail: upErr.message });
+
+    const { data: pub } = supabase.storage.from(BUCKET).getPublicUrl(objectKey);
+    return res.json({ publicUrl: pub.publicUrl, path: objectKey });
+  } catch (e) {
+    return res.status(500).json({ error: 'Error interno', detail: e?.message });
+  }
+});
+
+// ───────────────────────────────────────────────────────────
+// ADMIN: Generador (form simple embebido) — útil de respaldo
+// ───────────────────────────────────────────────────────────
 app.get('/admin/new', (_req, res) => {
   res.type('html').send(`
     <html><body style="font-family: system-ui; max-width:680px; margin:24px auto;">
-      <h1>Generar link</h1>
+      <h1>Generar link (simple)</h1>
       <form method="POST" action="/admin/new">
-        <label>Slug (id): <input name="slug" required pattern="[a-zA-Z0-9_-]{3,}"/></label><br/><br/>
+        <label>Slug (id): <input name="slug" required pattern="[-A-Za-z0-9_]{3,}"/></label><br/><br/>
         <label>Nombre visible: <input name="display_name" required /></label><br/><br/>
+        <label>Subtitle: <input name="subtitle" /></label><br/><br/>
+        <label>Instagram: <input name="instagram" placeholder="https://..."/></label><br/><br/>
+        <label>Onlyfans: <input name="onlyfans" placeholder="https://..."/></label><br/><br/>
+        <label>TikTok: <input name="tiktok" placeholder="https://..."/></label><br/><br/>
         <label>Campo destino:
           <select name="field">
             <option value="instagram">instagram</option>
@@ -283,7 +308,10 @@ app.get('/admin/new', (_req, res) => {
             <option value="tiktok">tiktok</option>
           </select>
         </label><br/><br/>
-        <label>URL destino (https://...): <input name="target_url" required style="width:100%"/></label><br/><br/>
+        <label>Tipo de enlace público:</label>
+        <label><input type="radio" name="link_mode" value="landing" checked/> Landing (/searchEngine/slug)</label>
+        <label><input type="radio" name="link_mode" value="instructions"/> Solo instrucciones (/instructions/slug)</label><br/><br/>
+        <label>URL foto (si ya subiste por /admin/upload-photo): <input name="photo" placeholder="https://..."/></label><br/><br/>
         <button type="submit">Crear</button>
       </form>
       <p style="margin-top:16px;"><a href="/admin/list">Ver listado</a></p>
@@ -293,33 +321,42 @@ app.get('/admin/new', (_req, res) => {
 
 app.post('/admin/new', async (req, res) => {
   try {
-    const slug = String(req.body.slug || '').trim();
+    const slug        = String(req.body.slug || '').trim();
     const displayName = String(req.body.display_name || '').trim();
-    const field = String(req.body.field || DEFAULT_LINK_FIELD).toLowerCase();
-    const targetUrl = String(req.body.target_url || '').trim();
+    const subtitle    = String(req.body.subtitle || '').trim();
+    const instagram   = String(req.body.instagram || '').trim() || null;
+    const onlyfans    = String(req.body.onlyfans  || '').trim() || null;
+    const tiktok      = String(req.body.tiktok    || '').trim() || null;
+    const field       = String(req.body.field || DEFAULT_LINK_FIELD).toLowerCase();
+    const linkMode    = String(req.body.link_mode || 'landing'); // landing | instructions
+    const photoUrl    = String(req.body.photo || '').trim() || null;
 
-    if (!/^[a-zA-Z0-9_-]{3,}$/.test(slug)) {
+    if (!/^[-A-Za-z0-9_]{3,}$/.test(slug)) {
       return res.status(400).send('Slug inválido (mín 3, alfanumérico, _ o -)');
     }
+    if (!displayName) return res.status(400).send('name requerido');
     if (!ALLOWED_FIELDS.has(field)) {
       return res.status(400).send('Campo destino inválido');
     }
-    if (!isSafeHttpUrl(targetUrl)) {
-      return res.status(400).send('URL destino inválida (http/https requerido)');
+    if (!['landing','instructions'].includes(linkMode)) {
+      return res.status(400).send('link_mode inválido');
+    }
+    for (const u of [instagram, onlyfans, tiktok, photoUrl]) {
+      if (u && !isSafeHttpUrl(u)) return res.status(400).send(`URL inválida: ${u}`);
     }
 
-    // PUBLIC URL automático apuntando a /searchEngine/<slug>
-    const publicUrl = computePublicUrl(slug);
+    const publicUrl = computePublicUrlFromMode(slug, linkMode);
 
     const insertObj = {
       id: slug,
       name: displayName,
-      public_url: publicUrl,
-      instagram: null,
-      onlyfans: null,
-      tiktok: null
+      subtitle,
+      instagram,
+      onlyfans,
+      tiktok,
+      photo: photoUrl,
+      public_url: publicUrl // ← queda guardado con BASE_PUBLIC_URL
     };
-    insertObj[field] = targetUrl;
 
     const { error } = await supabase
       .from('links')
@@ -337,11 +374,14 @@ app.post('/admin/new', async (req, res) => {
         <h1>Creado ✅</h1>
         <p><b>Slug:</b> ${slug}</p>
         <p><b>Nombre:</b> ${displayName}</p>
-        <p><b>Campo:</b> ${field}</p>
-        <p><b>Destino:</b> <a href="${targetUrl}">${targetUrl}</a></p>
-        <p><b>URL pública:</b> <a href="${publicUrl}">${publicUrl}</a></p>
+        <p><b>Subtitle:</b> ${subtitle || ''}</p>
+        <p><b>Instagram:</b> ${instagram || ''}</p>
+        <p><b>Onlyfans:</b> ${onlyfans || ''}</p>
+        <p><b>TikTok:</b> ${tiktok || ''}</p>
+        <p><b>Foto:</b> ${photoUrl ? `<a href="${photoUrl}" target="_blank">ver</a>` : '—'}</p>
+        <p><b>Public URL:</b> <a href="${publicUrl}" target="_blank">${publicUrl}</a></p>
         <p style="margin-top:16px;">
-          <a href="/searchEngine/${slug}">Probar /searchEngine/${slug}</a> |
+          <a href="${publicUrl}" target="_blank">Probar</a> |
           <a href="/admin/new">Crear otro</a> |
           <a href="/admin/list">Ver listado</a>
         </p>
@@ -357,7 +397,7 @@ app.post('/admin/new', async (req, res) => {
 app.get('/admin/list', async (_req, res) => {
   const { data, error } = await supabase
     .from('links')
-    .select('id,name,instagram,onlyfans,tiktok,public_url')
+    .select('id,name,instagram,onlyfans,tiktok,public_url,photo,subtitle')
     .order('id');
 
   if (error) return res.status(500).send('Error listando');
@@ -366,10 +406,12 @@ app.get('/admin/list', async (_req, res) => {
     <tr>
       <td>${r.id}</td>
       <td>${r.name || ''}</td>
+      <td>${r.subtitle || ''}</td>
       <td>${r.instagram || ''}</td>
       <td>${r.onlyfans || ''}</td>
       <td>${r.tiktok || ''}</td>
-      <td>${r.public_url ? `<a href="${r.public_url}">${r.public_url}</a>` : ''}</td>
+      <td>${r.photo ? `<a href="${r.photo}" target="_blank">foto</a>` : ''}</td>
+      <td>${r.public_url ? `<a href="${r.public_url}" target="_blank">${r.public_url}</a>` : ''}</td>
     </tr>`).join('');
 
   res.type('html').send(`
@@ -378,7 +420,7 @@ app.get('/admin/list', async (_req, res) => {
       <p><a href="/admin/new">Crear nuevo</a></p>
       <table border="1" cellspacing="0" cellpadding="6">
         <thead><tr>
-          <th>id (slug)</th><th>name</th><th>instagram</th><th>onlyfans</th><th>tiktok</th><th>public_url</th>
+          <th>id (slug)</th><th>name</th><th>subtitle</th><th>instagram</th><th>onlyfans</th><th>tiktok</th><th>photo</th><th>public_url</th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>
@@ -386,14 +428,74 @@ app.get('/admin/list', async (_req, res) => {
   `);
 });
 
-// -------------------------------------------
+// ───────────────────────────────────────────────────────────
+// API moderna: Crear/actualizar link (JSON)
+// ───────────────────────────────────────────────────────────
+app.post('/api/links', async (req, res) => {
+  try {
+    const {
+      slug,
+      display_name,
+      subtitle,
+      instagram,
+      onlyfans,
+      tiktok,
+      link_mode = 'landing', // 'landing' | 'instructions'
+      photo,                 // URL pública (opcional)
+    } = req.body || {};
+
+    const id = String(slug || '').trim();
+    if (!/^[-A-Za-z0-9_]{3,}$/.test(id)) return res.status(400).json({ error: 'Slug inválido' });
+    if (!display_name) return res.status(400).json({ error: 'name requerido' });
+    if (!['landing','instructions'].includes(link_mode)) {
+      return res.status(400).json({ error: 'link_mode inválido' });
+    }
+    for (const u of [instagram, onlyfans, tiktok, photo]) {
+      if (u && !isSafeHttpUrl(String(u))) return res.status(400).json({ error: `URL inválida: ${u}` });
+    }
+
+    // genera SIEMPRE con tu dominio del .env
+    const publicUrl = computePublicUrlFromMode(id, link_mode);
+
+    const insertObj = {
+      id,
+      name: String(display_name),
+      subtitle: subtitle ? String(subtitle) : null,
+      instagram: instagram || null,
+      onlyfans: onlyfans || null,
+      tiktok: tiktok || null,
+      photo: photo || null,
+      public_url: publicUrl
+    };
+
+    const { data, error } = await supabase.from('links')
+      .upsert(insertObj, { onConflict: 'id' })
+      .select()
+      .maybeSingle();
+
+    if (error) return res.status(500).json({ error: 'No se pudo guardar', detail: error.message });
+
+    linksCache.delete(id);
+
+    res.json({
+      ok: true,
+      record: data || insertObj,
+      public_url: publicUrl
+    });
+  } catch (e) {
+    return res.status(500).json({ error: 'Error interno', detail: e?.message });
+  }
+});
+
+// ───────────────────────────────────────────────────────────
 // SLUG router: compat → redirige a /searchEngine/<slug>
-// -------------------------------------------
+// (NO escribe en DB)
+// ───────────────────────────────────────────────────────────
 const RESERVED_PREFIXES = new Set([
   'clook', 'ping', 'c', 'instructions', 'searchengine', 'loading', 'secret',
-  'favicon.ico', 'robots.txt', 'healthz', 'admin', 'private' // ← incluye private
+  'favicon.ico', 'robots.txt', 'healthz', 'admin', 'private', 'private-link', 'api'
 ]);
-function looksLikeSlug(s) { return /^[a-zA-Z0-9_-]{3,}$/.test(s); }
+function looksLikeSlug(s) { return /^[-A-Za-z0-9_]{3,}$/.test(s); }
 
 app.get('/:slug', async (req, res, next) => {
   try {
@@ -402,10 +504,7 @@ app.get('/:slug', async (req, res, next) => {
     if (RESERVED_PREFIXES.has(low)) return next();
     if (!looksLikeSlug(slug)) return next();
 
-    // Asegura que public_url está correcto (con /searchEngine/)
-    await ensurePublicUrlPersisted(slug);
-
-    // Compatibilidad: manda al flujo de la app
+    // por compatibilidad, lleva al flujo principal
     return res.redirect(302, `/searchEngine/${slug}`);
   } catch (e) {
     console.error('Error en slug router:', e?.message || e);
@@ -413,13 +512,29 @@ app.get('/:slug', async (req, res, next) => {
   }
 });
 
-// -------------------------------------------
+// ───────────────────────────────────────────────────────────
 // Rutas originales (tu flujo de vistas)
-// -------------------------------------------
+// ───────────────────────────────────────────────────────────
 app.get("/", async (req, res) => {
-  const links = await getLinks();
-  const defaultId = Object.keys(links)[0] || "default";
-  return res.redirect(`/instructions/${defaultId}`);
+  try {
+    const links = await getLinks();
+    const ids = Object.keys(links);
+    if (ids.length === 0) {
+      // Evita 404 al inicio cuando DB está vacía
+      return res.type('html').send(`
+        <html><body style="font-family: system-ui; max-width:680px; margin:24px auto;">
+          <h1>Bienvenido</h1>
+          <p>No hay registros aún.</p>
+          <p><a href="/private-link">Abrir generador privado</a> | <a href="/admin/new">Formulario de respaldo</a></p>
+        </body></html>
+      `);
+    }
+    const defaultId = ids[0];
+    return res.redirect(`/instructions/${defaultId}`);
+  } catch (e) {
+    console.error('GET / error:', e?.message || e);
+    return res.status(500).send('Error interno');
+  }
 });
 
 app.get("/c/:id", async (req, res) => {
@@ -430,10 +545,13 @@ app.get("/c/:id", async (req, res) => {
 });
 
 app.get('/instructions/:id', async (req, res) => {
-  const links = await getLinks();
   const id = req.params.id;
-  const model = links[id];
-  if (!model) return res.status(404).send("Invalid link");
+  const model = await getLinkRow(id);
+
+  // Si no hay registro, mostramos igual la página de instrucciones (modo "solo instrucciones")
+  if (!model) {
+    return res.render('instructions', { id });
+  }
 
   const ip = getRealIp(req);
   trackUserAction(ip, 'visit_instructions');
@@ -448,9 +566,8 @@ app.get('/instructions/:id', async (req, res) => {
 });
 
 app.get('/searchEngine/:id', async (req, res) => {
-  const links = await getLinks();
   const id = req.params.id;
-  const model = links[id];
+  const model = await getLinkRow(id);
   if (!model) return res.status(404).send("Invalid link");
 
   const ip = getRealIp(req);
@@ -460,13 +577,9 @@ app.get('/searchEngine/:id', async (req, res) => {
 });
 
 app.get('/loading/:id', async (req, res) => {
-  const links = await getLinks();
   const id = req.params.id;
-  const model = links[id];
+  const model = await getLinkRow(id);
   if (!model) return res.status(404).send("Invalid link");
-
-  const ip = getRealIp(req);
-  trackUserAction(ip, 'visit_loading');
 
   const ua = req.headers['user-agent'] || '';
   if (isBot(req) || isTikTokInAppBrowser(ua) || isInstagramInAppBrowser(ua)) {
@@ -476,13 +589,9 @@ app.get('/loading/:id', async (req, res) => {
 });
 
 app.get('/secret/:id', async (req, res) => {
-  const links = await getLinks();
   const id = req.params.id;
-  const model = links[id];
+  const model = await getLinkRow(id);
   if (!model) return res.status(404).send("Invalid link");
-
-  const ip = getRealIp(req);
-  trackUserAction(ip, 'visit_secret');
 
   const ua = req.headers['user-agent'] || '';
   if (isBot(req) || isTikTokInAppBrowser(ua) || isInstagramInAppBrowser(ua)) {
@@ -494,5 +603,5 @@ app.get('/secret/:id', async (req, res) => {
 // Health
 app.get('/ping', (req, res) => res.status(200).send('pong'));
 
-// -------------------------------------------
+// ───────────────────────────────────────────────────────────
 app.listen(port, () => console.log(`Server running on port ${port}`));

@@ -1,0 +1,19 @@
+http://127.0.0.1:3001/private/private-link.html, pagina admin
+
+NODE_ENV=production
+PORT=3001
+
+
+BASE_PUBLIC_URL=https://securelinks.com
+
+
+SUPABASE_URL=https://fptwztporosusnwcwvny.supabase.co
+
+
+SUPABASE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZwdHd6dHBvcm9zdXNud2N3dm55Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NDgxMTQxNCwiZXhwIjoyMDgwMzg3NDE0fQ.E8U5yh9Og8oBnxbSWuyuzYUFB59vXJrPXcstFhdDFhA
+
+
+DEFAULT_LINK_FIELD=onlyfans    
+SLUG_FORWARD_MODE=exact         
+REMOVE_WWW=true
+CACHE_TTL_MS=300000

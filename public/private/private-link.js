@@ -1,107 +1,132 @@
-const form = document.querySelector('#genForm');
-const modalBackdrop = document.querySelector('#modalBackdrop');
-const modalLinkText = document.querySelector('#modalLinkText');
-const copyBtn = document.querySelector('#copyBtn');
-const openBtn = document.querySelector('#openBtn');
-const closeBtn = document.querySelector('#closeBtn');
+// public/private/private-link.js
 
-function hostOnly() {
-  // p.ej. "127.0.0.1:3000" o "midominio.com"
-  return window.location.host.replace(/\/+$/, '');
-}
-function originSafe() {
-  // p.ej. "http://127.0.0.1:3000"
-  return window.location.origin.replace(/\/+$/, '');
-}
-function showModal() { modalBackdrop.style.display = 'flex'; }
-function hideModal() { modalBackdrop.style.display = 'none'; }
+const $ = sel => document.querySelector(sel);
+const form = $('#genForm');
+const errorBox = $('#errorBox');
 
-function looksLikeSlug(s) {
-  return /^[a-zA-Z0-9_-]{3,}$/.test(s);
+const modal = $('#modalBackdrop');
+const modalText = $('#modalLinkText');
+const copyBtn = $('#copyBtn');
+const openBtn = $('#openBtn');
+const closeBtn = $('#closeBtn');
+
+function showError(msg) {
+  errorBox.textContent = msg;
+  errorBox.style.display = 'block';
 }
-function looksLikeHttpUrl(u) {
+function clearError() {
+  errorBox.textContent = '';
+  errorBox.style.display = 'none';
+}
+function openModal(url) {
+  modalText.textContent = url;
+  openBtn.href = url;
+  modal.style.display = 'flex';
+}
+function closeModal() {
+  modal.style.display = 'none';
+}
+
+copyBtn.addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(modalText.textContent);
+    copyBtn.textContent = '¡Copiado!';
+    setTimeout(() => (copyBtn.textContent = 'Copiar'), 1200);
+  } catch { /* noop */ }
+});
+closeBtn.addEventListener('click', closeModal);
+modal.addEventListener('click', (e) => {
+  if (e.target === modal) closeModal();
+});
+
+function isUrl(u) {
   try { const x = new URL(u); return x.protocol === 'http:' || x.protocol === 'https:'; }
   catch { return false; }
 }
 
-async function upsertLink({ slug, displayName, targetUrl }) {
-  // Reutiliza el endpoint existente /admin/new
-  const formData = new URLSearchParams();
-  formData.set('slug', slug);
-  formData.set('display_name', displayName);
-  formData.set('field', 'instagram');       // fijo
-  formData.set('target_url', targetUrl);
+// Sube la foto SÓLO al guardar
+async function uploadPhotoIfNeeded(slug) {
+  const fileInput = document.getElementById('photoFile');
+  const file = fileInput.files?.[0];
+  if (!file) return null;
 
-  const res = await fetch('/admin/new', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
-    body: formData.toString()
-  });
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('slug', slug);
 
-  if (!res.ok) {
-    const text = await res.text().catch(()=>'');
-    throw new Error(`Fallo guardando (${res.status}): ${text || 'sin detalle'}`);
+  const r = await fetch('/api/upload-photo', { method: 'POST', body: fd });
+  if (!r.ok) {
+    const t = await r.text().catch(() => '');
+    throw new Error(`Fallo al subir imagen: ${t || r.status}`);
   }
+  const js = await r.json();
+  return js.publicUrl || null;
 }
 
-form.addEventListener('submit', async (e) => {
-  e.preventDefault();
+async function createOrUpdateLink(payload) {
+  const r = await fetch('/api/links', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(() => '');
+    throw new Error(`Fallo al guardar: ${t || r.status}`);
+  }
+  return r.json();
+}
 
-  const slug = (document.querySelector('#slug')?.value || '').trim();
-  const displayName = (document.querySelector('#displayName')?.value || '').trim();
-  const targetUrl = (document.querySelector('#targetUrl')?.value || '').trim();
-
-  if (!looksLikeSlug(slug)) {
-    alert('Slug inválido. Usa alfanumérico, "_" o "-", mínimo 3 caracteres.');
-    return;
-  }
-  if (!displayName) {
-    alert('Ingresa el nombre a mostrar.');
-    return;
-  }
-  if (!looksLikeHttpUrl(targetUrl)) {
-    alert('El link de destino debe comenzar con http:// o https://');
-    return;
-  }
+form.addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  clearError();
 
   try {
-    // Guarda en tu backend (crea/actualiza la fila y public_url)
-    await upsertLink({ slug, displayName, targetUrl });
+    const slug = String($('#slug').value || '').trim();
+    const display_name = String($('#displayName').value || '').trim();
+    const subtitle = String($('#subtitle').value || '').trim();
 
-    // Muestra solo "dominio/searchEngine/slug" (sin protocolo)
-    const host = hostOnly();
-    const pathPretty = `${host}/searchEngine/${slug}`;
-    modalLinkText.textContent = pathPretty;
+    const link_mode = document.querySelector('input[name="link_mode"]:checked')?.value || 'landing';
 
-    // Y habilita "Abrir" con el origin completo (con protocolo)
-    const full = `${originSafe()}/searchEngine/${slug}`;
-    openBtn.href = full;
+    const instagram = String($('#instagram').value || '').trim();
+    const onlyfans = String($('#onlyfans').value || '').trim();
+    const tiktok = String($('#tiktok').value || '').trim();
 
-    showModal();
-  } catch (err) {
-    console.error(err);
-    alert(err.message || 'No se pudo guardar el link.');
+    if (!/^[-A-Za-z0-9_]{3,}$/.test(slug)) {
+      return showError('Slug inválido (mín 3, alfanumérico, _ o -)');
+    }
+    if (!display_name) {
+      return showError('El nombre visible es requerido');
+    }
+
+    for (const u of [instagram, onlyfans, tiktok]) {
+      if (u && !isUrl(u)) return showError(`URL inválida: ${u}`);
+    }
+
+    // 1) Subir foto si se eligió
+    const photoUrl = await uploadPhotoIfNeeded(slug);
+
+    // 2) Guardar registro
+    const payload = {
+      slug,
+      display_name,
+      subtitle: subtitle || null,
+      instagram: instagram || null,
+      onlyfans: onlyfans || null,
+      tiktok: tiktok || null,
+      photo: photoUrl || null,
+      link_mode // 'landing' | 'instructions'
+    };
+
+    const res = await createOrUpdateLink(payload);
+    if (!res.ok) throw new Error(res.error || 'No ok');
+
+    // 3) Mostrar modal con el public_url
+    openModal(res.public_url);
+
+    // 4) Opcional: reset del input file, pero mantenemos campos
+    const fileInput = document.getElementById('photoFile');
+    if (fileInput) fileInput.value = '';
+  } catch (e) {
+    showError(e?.message || 'Error inesperado');
   }
-});
-
-copyBtn.addEventListener('click', async () => {
-  try {
-    await navigator.clipboard.writeText(modalLinkText.textContent);
-    copyBtn.textContent = 'Copiado';
-    setTimeout(() => (copyBtn.textContent = 'Copiar'), 1600);
-  } catch {
-    // Fallback copiar seleccionando
-    const range = document.createRange();
-    range.selectNodeContents(modalLinkText);
-    const sel = window.getSelection();
-    sel.removeAllRanges(); sel.addRange(range);
-    try { document.execCommand('copy'); } catch {}
-    sel.removeAllRanges();
-  }
-});
-
-closeBtn.addEventListener('click', hideModal);
-modalBackdrop.addEventListener('click', (e) => {
-  // cierra si hacen click fuera del modal
-  if (e.target === modalBackdrop) hideModal();
 });
