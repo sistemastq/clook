@@ -10,9 +10,9 @@ import { fileURLToPath } from 'url';
 import { supabase } from './supabaseClient.js';
 
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __dirname  = path.dirname(__filename);
 
-const app = express();
+const app  = express();
 const port = process.env.PORT || 3000;
 
 // ───────────────────────────────────────────────────────────
@@ -40,13 +40,19 @@ app.get('/private-link', (_req, res) => {
 // ───────────────────────────────────────────────────────────
 app.set('trust proxy', true);
 
-const REMOVE_WWW = String(process.env.REMOVE_WWW || 'true') === 'true';
-const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 300000);
+const REMOVE_WWW         = String(process.env.REMOVE_WWW || 'true') === 'true';
+const CACHE_TTL_MS       = Number(process.env.CACHE_TTL_MS || 300000);
+
+// Para pruebas locales aseguramos 127.0.0.1:3000 por defecto
+const BASE_PUBLIC_URL    = (process.env.BASE_PUBLIC_URL || 'http://127.0.0.1:3000').replace(/\/+$/, '');
 const DEFAULT_LINK_FIELD = (process.env.DEFAULT_LINK_FIELD || 'instagram').toLowerCase();
-const BASE_PUBLIC_URL = (process.env.BASE_PUBLIC_URL || 'http://127.0.0.1:3000').replace(/\/+$/, '');
-const BUCKET = 'public-fotos'; // ← tu bucket
+
+const BUCKET         = 'public-fotos'; // ← tu bucket
 const ALLOWED_FIELDS = new Set(['instagram', 'onlyfans', 'tiktok']);
 
+// ───────────────────────────────────────────────────────────
+// Utilidades
+// ───────────────────────────────────────────────────────────
 function getRealIp(req) {
   const fwd = req.headers['x-forwarded-for'];
   if (fwd) return fwd.split(',')[0].trim();
@@ -57,9 +63,13 @@ function isSafeHttpUrl(u) {
   catch { return false; }
 }
 function computePublicUrlFromMode(slug, mode) {
-  const base = BASE_PUBLIC_URL; // ← toma tu dominio del .env (p.ej. https://securelinks.com)
+  const base = BASE_PUBLIC_URL; // usa tu dominio/base del .env
   if (mode === 'instructions') return `${base}/instructions/${slug}`;
   return `${base}/searchEngine/${slug}`; // landing por defecto
+}
+function uaMatches(list, ua) {
+  const s = String(ua || '').toLowerCase();
+  return list.some(t => s.includes(t));
 }
 
 // ───────────────────────────────────────────────────────────
@@ -74,7 +84,7 @@ try {
 }
 
 // ───────────────────────────────────────────────────────────
-/** Caché simple de lecturas */
+// Caché simple de lecturas
 // ───────────────────────────────────────────────────────────
 const linksCache = new Map(); // key: id, value: { val, exp }
 function cacheGet(map, key) {
@@ -112,7 +122,11 @@ async function getLinkRow(linkId) {
   const cached = cacheGet(linksCache, linkId);
   if (cached) return cached;
 
-  const { data, error } = await supabase.from('links').select('*').eq('id', linkId).maybeSingle();
+  const { data, error } = await supabase.from('links')
+    .select('*')
+    .eq('id', linkId)
+    .maybeSingle();
+
   if (error) {
     console.error('DB error (links):', error.message);
     return null;
@@ -122,17 +136,17 @@ async function getLinkRow(linkId) {
 }
 
 // ───────────────────────────────────────────────────────────
-// Bot / UA / Rate limit (tu lógica original)
+// Rate limit y Bot Shield (ligero en local)
 // ───────────────────────────────────────────────────────────
-const requestTimes = {};
-const MAX_REQUESTS = 50;
-const TIME_WINDOW = 60000;
+const requestTimes   = {};
+const MAX_REQUESTS   = 80;     // más laxo en local
+const TIME_WINDOW    = 60000;
 
 function rateLimiter(req, res, next) {
-  const ip = getRealIp(req);
-  const sessionId = req.sessionId || 'anon';
-  const key = `${ip}_${sessionId}`;
-  const now = Date.now();
+  const ip        = getRealIp(req);
+  const sessionId = req.cookies.sessionId || 'anon';
+  const key       = `${ip}_${sessionId}`;
+  const now       = Date.now();
 
   if (!requestTimes[key]) requestTimes[key] = [];
   requestTimes[key] = requestTimes[key].filter(t => now - t < TIME_WINDOW);
@@ -143,66 +157,10 @@ function rateLimiter(req, res, next) {
   requestTimes[key].push(now);
   next();
 }
-function isSearchEngine(userAgent) {
-  const bots = [
-    'googlebot','bingbot','slurp','duckduckbot','baiduspider',
-    'yandexbot','sogou','exabot','facebot','applebot',
-    'facebookexternalhit','twitterbot','linkedinbot','embedly',
-    'quora link preview','showyoubot','outbrain','pinterest',
-    'vkshare','w3c_validator'
-  ];
-  const ua = (userAgent || '').toLowerCase();
-  return bots.some(b => ua.includes(b));
-}
-function isTikTokInAppBrowser(userAgent) {
-  const ua = (userAgent || '').toLowerCase();
-  return ua.includes('tiktok') || ua.includes('musically');
-}
-function isInstagramInAppBrowser(userAgent) {
-  const ua = (userAgent || '').toLowerCase();
-  const patterns = ['instagram','fban/instagram','fb_iab','fbav','instagramapp','instagram 3','version/0'];
-  return patterns.some(p => ua.includes(p));
-}
-function isMissingUserAgent(userAgent) { return !userAgent || userAgent.trim() === ''; }
-function isSuspiciousUserAgent(userAgent) {
-  if (!userAgent) return true;
-  const ua = userAgent.toLowerCase();
-  const suspicious = [
-    'python-requests','axios/','curl/','wget','node-fetch',
-    'httpclient','java/','go-http','scrapy','spider','bot',
-    'crawler','libwww','unknown','apache-httpclient'
-  ];
-  return suspicious.some(p => ua.includes(p));
-}
-const userActions = {};
-function trackUserAction(ip, action) {
-  if (!userActions[ip]) userActions[ip] = [];
-  userActions[ip].push({ action, timestamp: Date.now() });
-}
-function isSuspiciousBehavior(ip) {
-  if (!userActions[ip]) return false;
-  const actions = userActions[ip];
-  const recent = actions.filter(a => Date.now() - a.timestamp < 10000);
-  return recent.length > 5;
-}
-function isBot(req) {
-  const ua = req.headers['user-agent'];
-  const ip = getRealIp(req);
-  return (
-    isMissingUserAgent(ua) ||
-    isSearchEngine(ua) ||
-    isSuspiciousUserAgent(ua) ||
-    isSuspiciousBehavior(ip)
-  );
-}
-
-// ───────────────────────────────────────────────────────────
-// Middlewares de sesión, rate-limit, captcha, honeypot
-// ───────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   if (!req.cookies.sessionId) {
     const sessionId = crypto.randomBytes(16).toString('hex');
-    res.cookie('sessionId', sessionId, { httpOnly: true });
+    res.cookie('sessionId', sessionId, { httpOnly: true, sameSite: 'Lax' });
     req.sessionId = sessionId;
   } else {
     req.sessionId = req.cookies.sessionId;
@@ -211,24 +169,111 @@ app.use((req, res, next) => {
 });
 app.use(rateLimiter);
 
-function captchaMiddleware(req, res, next) {
-  const ip = getRealIp(req);
-  if (isSuspiciousBehavior(ip)) return res.render('captcha');
-  next();
-}
-app.use(captchaMiddleware);
+// Listas básicas
+const KNOWN_SEARCH_BOTS = [
+  'googlebot','bingbot','slurp','duckduckbot','baiduspider','yandexbot','sogou','exabot',
+  'facebot','facebookexternalhit','applebot','twitterbot','linkedinbot','embedly',
+  'quora link preview','pinterest','vkshare','w3c_validator','semrushbot','ahrefsbot',
+  'mj12bot','ccbot','dotbot','linkedinbot','qwantify','redditbot','discordbot','telegrambot'
+];
 
-function honeypotMiddleware(req, res, next) {
-  if (req.body && req.body.honeypot) {
-    console.log('Honeypot triggered → bot');
-    return res.render('searchEngine', { id: 'bot', model: {} });
+const GENERIC_BOT_TOKENS = [
+  'crawler','spider','bot','fetch','httpclient','apache-httpclient','libwww','python-requests',
+  'axios/','curl/','wget','go-http','java/','scrapy','node-fetch','perl','php','httpx'
+];
+
+const HEADLESS_HINTS = [
+  'headlesschrome','puppeteer','playwright','phantomjs'
+];
+
+function headerAnomalies(req) {
+  let score = 0;
+  const h   = req.headers;
+
+  const ua     = String(h['user-agent'] || '').toLowerCase();
+  const accept = String(h['accept'] || '');
+  const al     = String(h['accept-language'] || '');
+  const enc    = String(h['accept-encoding'] || '');
+  const secua  = String(h['sec-ch-ua'] || '');
+
+  if (!ua || ua.length < 10) score += 2;
+  if (!accept.includes('text/html') && !accept.includes('*/*')) score += 1;
+  if (!al) score += 0.5;
+  if (!enc) score += 0.5;
+  if (!secua) score += 0.5;
+
+  if (HEADLESS_HINTS.some(t => ua.includes(t))) score += 2;
+
+  return score;
+}
+
+function recentBurstScore(req) {
+  const ip      = getRealIp(req);
+  const session = req.cookies.sessionId || 'anon';
+  const key     = `${ip}_${session}`;
+  const now     = Date.now();
+  const recent  = (requestTimes[key] || []).filter(t => now - t < 4000).length;
+  return recent >= 12 ? 3 : recent >= 8 ? 2 : recent >= 5 ? 1 : 0;
+}
+
+function botScore(req) {
+  const ua = String(req.headers['user-agent'] || '').toLowerCase();
+  let score = 0;
+
+  if (uaMatches(KNOWN_SEARCH_BOTS, ua))   score += 5;
+  if (uaMatches(GENERIC_BOT_TOKENS, ua))  score += 3;
+  score += headerAnomalies(req);
+  score += recentBurstScore(req);
+
+  return score;
+}
+
+const BOT_BLOCK_THRESHOLD     = 10; // 403 directo
+const BOT_CHALLENGE_THRESHOLD = 7;  // challenge JS (si lo activas)
+
+const JS_CHALLENGE_COOKIE = 'js_challenge';
+const JS_CHALLENGE_TTL_MS = 10 * 60 * 1000; // 10 min
+
+app.get('/challenge', (req, res) => {
+  const back = req.query.back || '/';
+  res.type('html').send(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Verificación</title></head>
+<body style="font-family:system-ui;background:#0b0f14;color:#e7f0f7">
+  <p>Verificando tu navegador…</p>
+  <script>
+    try {
+      document.cookie = "${JS_CHALLENGE_COOKIE}=1; path=/; max-age=${Math.floor(JS_CHALLENGE_TTL_MS/1000)}; samesite=Lax";
+      location.replace(${JSON.stringify(back)});
+    } catch(e) {
+      document.body.innerHTML = "<h1>Necesitamos habilitar JavaScript</h1>";
+    }
+  </script>
+  <noscript><h1>Habilita JavaScript para continuar</h1></noscript>
+</body></html>`);
+});
+
+function botShield(req, res, next) {
+  const score = botScore(req);
+  const pathOkForBots = /^\/(instructions|clook|public|assets|favicon\.ico|robots\.txt|ping|private-link)/i.test(req.path);
+
+  if (score >= BOT_BLOCK_THRESHOLD && !pathOkForBots) {
+    const m = req.path.match(/^\/(?:searchEngine|loading|secret)\/([^/]+)/i);
+    if (m) return res.render('instructions', { id: m[1] });
+    return res.status(403).send('Forbidden');
   }
+
+  const hasJS = Boolean(req.cookies[JS_CHALLENGE_COOKIE]);
+  if (score >= BOT_CHALLENGE_THRESHOLD && !hasJS && !pathOkForBots) {
+    const back = encodeURIComponent(req.originalUrl || req.url || '/');
+    return res.redirect(302, `/challenge?back=${back}`);
+  }
+
   next();
 }
-app.use(honeypotMiddleware);
+app.use(botShield);
 
 // ───────────────────────────────────────────────────────────
-// ADMIN: Upload foto (solo al guardar) - legacy
+// ADMIN: Upload foto (legacy y API moderna)
 // ───────────────────────────────────────────────────────────
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } }); // 8MB
 
@@ -236,18 +281,17 @@ app.post('/admin/upload-photo', upload.single('file'), async (req, res) => {
   try {
     const slug = String(req.body.slug || '').trim();
     const file = req.file;
-    if (!/^[-A-Za-z0-9_]{3,}$/.test(slug)) {
-      return res.status(400).send('Slug inválido');
-    }
+    if (!/^[-A-Za-z0-9_]{3,}$/.test(slug)) return res.status(400).send('Slug inválido');
     if (!file) return res.status(400).send('Archivo requerido');
 
-    const stamp = Date.now();
-    const safeName = (file.originalname || 'file').replace(/[^\w.\-]+/g, '_');
+    const stamp     = Date.now();
+    const safeName  = (file.originalname || 'file').replace(/[^\w.\-]+/g, '_');
     const objectKey = `${slug}/${stamp}-${safeName}`;
 
     const { error: upErr } = await supabase.storage
       .from(BUCKET)
       .upload(objectKey, file.buffer, { contentType: file.mimetype, upsert: true });
+
     if (upErr) {
       console.error('storage upload error:', upErr.message);
       return res.status(500).send('No se pudo subir');
@@ -261,9 +305,6 @@ app.post('/admin/upload-photo', upload.single('file'), async (req, res) => {
   }
 });
 
-// ───────────────────────────────────────────────────────────
-// API moderna: Upload foto (FormData: file + slug)
-// ───────────────────────────────────────────────────────────
 app.post('/api/upload-photo', upload.single('file'), async (req, res) => {
   try {
     const slug = String(req.body.slug || '').trim();
@@ -271,13 +312,14 @@ app.post('/api/upload-photo', upload.single('file'), async (req, res) => {
     if (!/^[-A-Za-z0-9_]{3,}$/.test(slug)) return res.status(400).json({ error: 'Slug inválido' });
     if (!file) return res.status(400).json({ error: 'Archivo requerido' });
 
-    const stamp = Date.now();
-    const safeName = (file.originalname || 'file').replace(/[^\w.\-]+/g, '_');
+    const stamp     = Date.now();
+    const safeName  = (file.originalname || 'file').replace(/[^\w.\-]+/g, '_');
     const objectKey = `${slug}/${stamp}-${safeName}`;
 
     const { error: upErr } = await supabase.storage
       .from(BUCKET)
       .upload(objectKey, file.buffer, { contentType: file.mimetype, upsert: true });
+
     if (upErr) return res.status(500).json({ error: 'No se pudo subir', detail: upErr.message });
 
     const { data: pub } = supabase.storage.from(BUCKET).getPublicUrl(objectKey);
@@ -288,7 +330,7 @@ app.post('/api/upload-photo', upload.single('file'), async (req, res) => {
 });
 
 // ───────────────────────────────────────────────────────────
-// ADMIN: Generador (form simple embebido) — útil de respaldo
+// ADMIN simple (HTML de respaldo)
 // ───────────────────────────────────────────────────────────
 app.get('/admin/new', (_req, res) => {
   res.type('html').send(`
@@ -355,7 +397,7 @@ app.post('/admin/new', async (req, res) => {
       onlyfans,
       tiktok,
       photo: photoUrl,
-      public_url: publicUrl // ← queda guardado con BASE_PUBLIC_URL
+      public_url: publicUrl // se guarda con BASE_PUBLIC_URL
     };
 
     const { error } = await supabase
@@ -454,7 +496,6 @@ app.post('/api/links', async (req, res) => {
       if (u && !isSafeHttpUrl(String(u))) return res.status(400).json({ error: `URL inválida: ${u}` });
     }
 
-    // genera SIEMPRE con tu dominio del .env
     const publicUrl = computePublicUrlFromMode(id, link_mode);
 
     const insertObj = {
@@ -493,18 +534,17 @@ app.post('/api/links', async (req, res) => {
 // ───────────────────────────────────────────────────────────
 const RESERVED_PREFIXES = new Set([
   'clook', 'ping', 'c', 'instructions', 'searchengine', 'loading', 'secret',
-  'favicon.ico', 'robots.txt', 'healthz', 'admin', 'private', 'private-link', 'api'
+  'favicon.ico', 'robots.txt', 'healthz', 'admin', 'private', 'private-link', 'api', 'challenge'
 ]);
 function looksLikeSlug(s) { return /^[-A-Za-z0-9_]{3,}$/.test(s); }
 
 app.get('/:slug', async (req, res, next) => {
   try {
     const slug = (req.params.slug || '').trim();
-    const low = slug.toLowerCase();
+    const low  = slug.toLowerCase();
     if (RESERVED_PREFIXES.has(low)) return next();
-    if (!looksLikeSlug(slug)) return next();
+    if (!looksLikeSlug(slug))       return next();
 
-    // por compatibilidad, lleva al flujo principal
     return res.redirect(302, `/searchEngine/${slug}`);
   } catch (e) {
     console.error('Error en slug router:', e?.message || e);
@@ -513,95 +553,46 @@ app.get('/:slug', async (req, res, next) => {
 });
 
 // ───────────────────────────────────────────────────────────
-// Rutas originales (tu flujo de vistas)
+// Rutas de vistas
 // ───────────────────────────────────────────────────────────
-app.get("/", async (req, res) => {
-  try {
-    const links = await getLinks();
-    const ids = Object.keys(links);
-    if (ids.length === 0) {
-      // Evita 404 al inicio cuando DB está vacía
-      return res.type('html').send(`
-        <html><body style="font-family: system-ui; max-width:680px; margin:24px auto;">
-          <h1>Bienvenido</h1>
-          <p>No hay registros aún.</p>
-          <p><a href="/private-link">Abrir generador privado</a> | <a href="/admin/new">Formulario de respaldo</a></p>
-        </body></html>
-      `);
-    }
-    const defaultId = ids[0];
-    return res.redirect(`/instructions/${defaultId}`);
-  } catch (e) {
-    console.error('GET / error:', e?.message || e);
-    return res.status(500).send('Error interno');
-  }
+
+// La raíz SIEMPRE muestra la página de administración (private-link)
+app.get("/", (_req, res) => {
+  return res.redirect(302, '/private-link');
 });
 
-app.get("/c/:id", async (req, res) => {
-  const links = await getLinks();
-  const id = req.params.id;
-  if (!links[id]) return res.status(404).send("Invalid link");
-  return res.redirect(`/instructions/${id}`);
-});
-
+// Renderiza instrucciones tal cual (sin redirigir)
 app.get('/instructions/:id', async (req, res) => {
   const id = req.params.id;
-  const model = await getLinkRow(id);
-
-  // Si no hay registro, mostramos igual la página de instrucciones (modo "solo instrucciones")
-  if (!model) {
-    return res.render('instructions', { id });
-  }
-
-  const ip = getRealIp(req);
-  trackUserAction(ip, 'visit_instructions');
-
-  const ua = req.headers['user-agent'] || '';
-  const isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(ua);
-
-  if ((isTikTokInAppBrowser(ua) || isInstagramInAppBrowser(ua)) && isMobile) {
-    return res.render('instructions', { id });
-  }
-  return res.redirect(`/searchEngine/${id}`);
+  return res.render('instructions', { id });
 });
 
 app.get('/searchEngine/:id', async (req, res) => {
-  const id = req.params.id;
+  const id    = req.params.id;
   const model = await getLinkRow(id);
   if (!model) return res.status(404).send("Invalid link");
-
-  const ip = getRealIp(req);
-  trackUserAction(ip, 'visit_searchEngine');
-
   return res.render('searchEngine', { id, model });
 });
 
 app.get('/loading/:id', async (req, res) => {
-  const id = req.params.id;
+  const id    = req.params.id;
   const model = await getLinkRow(id);
   if (!model) return res.status(404).send("Invalid link");
-
-  const ua = req.headers['user-agent'] || '';
-  if (isBot(req) || isTikTokInAppBrowser(ua) || isInstagramInAppBrowser(ua)) {
-    return res.redirect('https://instagram.com/tu_perfil');
-  }
   return res.render('loading', { id });
 });
 
 app.get('/secret/:id', async (req, res) => {
-  const id = req.params.id;
+  const id    = req.params.id;
   const model = await getLinkRow(id);
   if (!model) return res.status(404).send("Invalid link");
-
-  const ua = req.headers['user-agent'] || '';
-  if (isBot(req) || isTikTokInAppBrowser(ua) || isInstagramInAppBrowser(ua)) {
-    return res.redirect('https://instagram.com/tu_perfil');
-  }
-  return res.redirect(model.onlyfans);
+  return res.redirect(model.onlyfans || '/');
 });
 
 // Health
 app.get('/ping', (req, res) => res.status(200).send('pong'));
 
 // ───────────────────────────────────────────────────────────
-app.listen(port, () => console.log(`Server running on port ${port}`));
+app.listen(port, () => {
+  console.log(`Server running on http://127.0.0.1:${port}`);
+  console.log(`Admin UI available at → http://127.0.0.1:${port}/private-link`);
+});
