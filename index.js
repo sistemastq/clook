@@ -40,15 +40,37 @@ app.get('/private-link', (_req, res) => {
 // ───────────────────────────────────────────────────────────
 app.set('trust proxy', true);
 
-const REMOVE_WWW         = String(process.env.REMOVE_WWW || 'true') === 'true';
-const CACHE_TTL_MS       = Number(process.env.CACHE_TTL_MS || 300000);
+const REMOVE_WWW          = String(process.env.REMOVE_WWW || 'true') === 'true';
+const CACHE_TTL_MS        = Number(process.env.CACHE_TTL_MS || 300000);
+const DEFAULT_LINK_FIELD  = (process.env.DEFAULT_LINK_FIELD || 'instagram').toLowerCase();
+const BASE_PUBLIC_URL     = (process.env.BASE_PUBLIC_URL || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+const FORCE_HTTPS         = String(process.env.FORCE_HTTPS ?? 'true') === 'true';
 
-// Para pruebas locales aseguramos 127.0.0.1:3000 por defecto
-const BASE_PUBLIC_URL    = (process.env.BASE_PUBLIC_URL || 'http://127.0.0.1:3000').replace(/\/+$/, '');
-const DEFAULT_LINK_FIELD = (process.env.DEFAULT_LINK_FIELD || 'instagram').toLowerCase();
+// Opcional: Host del panel admin (si quieres restringir /private-link a un host concreto),
+// deja vacío para permitirlo en cualquier host.
+const ADMIN_HOST          = (process.env.ADMIN_HOST || '').toLowerCase(); // ej: "admin.tudominio.com"
 
-const BUCKET         = 'public-fotos'; // ← tu bucket
+const BUCKET         = 'public-fotos';
 const ALLOWED_FIELDS = new Set(['instagram', 'onlyfans', 'tiktok']);
+
+function normalizeHost(rawHostHeader = '') {
+  const host = String(rawHostHeader || '').toLowerCase().split(':')[0].trim();
+  if (!host) return '';
+  if (REMOVE_WWW && host.startsWith('www.')) return host.slice(4);
+  return host;
+}
+
+// Forzar HTTPS en producción (Render/Reverse proxy)
+app.use((req, res, next) => {
+  if (FORCE_HTTPS && process.env.NODE_ENV === 'production') {
+    const xfProto = req.headers['x-forwarded-proto'];
+    if (xfProto && xfProto !== 'https') {
+      const host = req.headers.host;
+      return res.redirect(301, `https://${host}${req.originalUrl}`);
+    }
+  }
+  next();
+});
 
 // ───────────────────────────────────────────────────────────
 // Utilidades
@@ -62,14 +84,22 @@ function isSafeHttpUrl(u) {
   try { const url = new URL(u); return url.protocol === 'http:' || url.protocol === 'https:'; }
   catch { return false; }
 }
-function computePublicUrlFromMode(slug, mode) {
-  const base = BASE_PUBLIC_URL; // usa tu dominio/base del .env
-  if (mode === 'instructions') return `${base}/instructions/${slug}`;
-  return `${base}/searchEngine/${slug}`; // landing por defecto
-}
 function uaMatches(list, ua) {
   const s = String(ua || '').toLowerCase();
   return list.some(t => s.includes(t));
+}
+function isValidDomain(host) {
+  return /^[a-z0-9-]+(\.[a-z0-9-]+)+$/i.test(String(host || '').trim());
+}
+function computePublicUrl(slug, mode, customDomain) {
+  // Si trae dominio propio, devolvemos SOLO https://dominio
+  if (customDomain && isValidDomain(customDomain)) {
+    return `https://${customDomain}`;
+  }
+  // Fallback clásico: BASE_PUBLIC_URL + ruta
+  const base = BASE_PUBLIC_URL;
+  if (mode === 'instructions') return `${base}/instructions/${slug}`;
+  return `${base}/searchEngine/${slug}`;
 }
 
 // ───────────────────────────────────────────────────────────
@@ -84,9 +114,11 @@ try {
 }
 
 // ───────────────────────────────────────────────────────────
-// Caché simple de lecturas
+// Cachés
 // ───────────────────────────────────────────────────────────
-const linksCache = new Map(); // key: id, value: { val, exp }
+const linksCache   = new Map(); // key: id, value: { val, exp }
+const domainCache  = new Map(); // key: domain, value: { val, exp }
+
 function cacheGet(map, key) {
   const hit = map.get(key);
   if (!hit) return null;
@@ -97,28 +129,7 @@ function cacheSet(map, key, val, ttl = CACHE_TTL_MS) {
   map.set(key, { val, exp: Date.now() + ttl });
 }
 
-async function getLinks() {
-  const { data, error } = await supabase.from('links').select('*');
-  if (error) {
-    console.error('Error fetching links from Supabase:', error);
-    return {};
-  }
-  const links = {};
-  (data || []).forEach(row => {
-    links[row.id] = {
-      onlyfans: row.onlyfans,
-      instagram: row.instagram,
-      tiktok: row.tiktok,
-      name: row.name,
-      subtitle: row.subtitle,
-      photo: row.photo,
-      public_url: row.public_url || null
-    };
-  });
-  return links;
-}
-
-async function getLinkRow(linkId) {
+async function getLinkRowById(linkId) {
   const cached = cacheGet(linksCache, linkId);
   if (cached) return cached;
 
@@ -128,19 +139,39 @@ async function getLinkRow(linkId) {
     .maybeSingle();
 
   if (error) {
-    console.error('DB error (links):', error.message);
+    console.error('DB error (links by id):', error.message);
     return null;
   }
   cacheSet(linksCache, linkId, data || null);
   return data || null;
 }
 
+async function getLinkRowByDomain(domain) {
+  const key = normalizeHost(domain);
+  if (!key) return null;
+
+  const cached = cacheGet(domainCache, key);
+  if (cached) return cached;
+
+  const { data, error } = await supabase.from('links')
+    .select('*')
+    .eq('domain', key)
+    .maybeSingle();
+
+  if (error) {
+    console.error('DB error (links by domain):', error.message);
+    return null;
+  }
+  cacheSet(domainCache, key, data || null);
+  return data || null;
+}
+
 // ───────────────────────────────────────────────────────────
-// Rate limit y Bot Shield (ligero en local)
+// Rate limit + Bot shield (ligero)
 // ───────────────────────────────────────────────────────────
-const requestTimes   = {};
-const MAX_REQUESTS   = 80;     // más laxo en local
-const TIME_WINDOW    = 60000;
+const requestTimes = {};
+const MAX_REQUESTS = 80;
+const TIME_WINDOW  = 60000;
 
 function rateLimiter(req, res, next) {
   const ip        = getRealIp(req);
@@ -169,22 +200,18 @@ app.use((req, res, next) => {
 });
 app.use(rateLimiter);
 
-// Listas básicas
+// Bot heuristics simples
 const KNOWN_SEARCH_BOTS = [
   'googlebot','bingbot','slurp','duckduckbot','baiduspider','yandexbot','sogou','exabot',
   'facebot','facebookexternalhit','applebot','twitterbot','linkedinbot','embedly',
   'quora link preview','pinterest','vkshare','w3c_validator','semrushbot','ahrefsbot',
   'mj12bot','ccbot','dotbot','linkedinbot','qwantify','redditbot','discordbot','telegrambot'
 ];
-
 const GENERIC_BOT_TOKENS = [
   'crawler','spider','bot','fetch','httpclient','apache-httpclient','libwww','python-requests',
   'axios/','curl/','wget','go-http','java/','scrapy','node-fetch','perl','php','httpx'
 ];
-
-const HEADLESS_HINTS = [
-  'headlesschrome','puppeteer','playwright','phantomjs'
-];
+const HEADLESS_HINTS = ['headlesschrome','puppeteer','playwright','phantomjs'];
 
 function headerAnomalies(req) {
   let score = 0;
@@ -201,12 +228,10 @@ function headerAnomalies(req) {
   if (!al) score += 0.5;
   if (!enc) score += 0.5;
   if (!secua) score += 0.5;
-
   if (HEADLESS_HINTS.some(t => ua.includes(t))) score += 2;
 
   return score;
 }
-
 function recentBurstScore(req) {
   const ip      = getRealIp(req);
   const session = req.cookies.sessionId || 'anon';
@@ -215,24 +240,19 @@ function recentBurstScore(req) {
   const recent  = (requestTimes[key] || []).filter(t => now - t < 4000).length;
   return recent >= 12 ? 3 : recent >= 8 ? 2 : recent >= 5 ? 1 : 0;
 }
-
 function botScore(req) {
   const ua = String(req.headers['user-agent'] || '').toLowerCase();
   let score = 0;
-
   if (uaMatches(KNOWN_SEARCH_BOTS, ua))   score += 5;
   if (uaMatches(GENERIC_BOT_TOKENS, ua))  score += 3;
   score += headerAnomalies(req);
   score += recentBurstScore(req);
-
   return score;
 }
-
-const BOT_BLOCK_THRESHOLD     = 10; // 403 directo
-const BOT_CHALLENGE_THRESHOLD = 7;  // challenge JS (si lo activas)
-
-const JS_CHALLENGE_COOKIE = 'js_challenge';
-const JS_CHALLENGE_TTL_MS = 10 * 60 * 1000; // 10 min
+const BOT_BLOCK_THRESHOLD     = 10;
+const BOT_CHALLENGE_THRESHOLD = 7;
+const JS_CHALLENGE_COOKIE     = 'js_challenge';
+const JS_CHALLENGE_TTL_MS     = 10 * 60 * 1000;
 
 app.get('/challenge', (req, res) => {
   const back = req.query.back || '/';
@@ -251,29 +271,24 @@ app.get('/challenge', (req, res) => {
   <noscript><h1>Habilita JavaScript para continuar</h1></noscript>
 </body></html>`);
 });
-
 function botShield(req, res, next) {
   const score = botScore(req);
-  const pathOkForBots = /^\/(instructions|clook|public|assets|favicon\.ico|robots\.txt|ping|private-link)/i.test(req.path);
+  const pathOkForBots = /^\/(instructions|clook|public|assets|favicon\.ico|robots\.txt|ping|private-link|admin|api|challenge)/i.test(req.path);
 
   if (score >= BOT_BLOCK_THRESHOLD && !pathOkForBots) {
-    const m = req.path.match(/^\/(?:searchEngine|loading|secret)\/([^/]+)/i);
-    if (m) return res.render('instructions', { id: m[1] });
     return res.status(403).send('Forbidden');
   }
-
   const hasJS = Boolean(req.cookies[JS_CHALLENGE_COOKIE]);
   if (score >= BOT_CHALLENGE_THRESHOLD && !hasJS && !pathOkForBots) {
     const back = encodeURIComponent(req.originalUrl || req.url || '/');
     return res.redirect(302, `/challenge?back=${back}`);
   }
-
   next();
 }
 app.use(botShield);
 
 // ───────────────────────────────────────────────────────────
-// ADMIN: Upload foto (legacy y API moderna)
+// Upload foto
 // ───────────────────────────────────────────────────────────
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } }); // 8MB
 
@@ -332,11 +347,19 @@ app.post('/api/upload-photo', upload.single('file'), async (req, res) => {
 // ───────────────────────────────────────────────────────────
 // ADMIN simple (HTML de respaldo)
 // ───────────────────────────────────────────────────────────
-app.get('/admin/new', (_req, res) => {
+function isAdminHost(req) {
+  if (!ADMIN_HOST) return true; // sin restricción
+  const host = normalizeHost(req.headers.host);
+  return host === normalizeHost(ADMIN_HOST);
+}
+
+app.get('/admin/new', (req, res) => {
+  if (!isAdminHost(req)) return res.status(404).send('Not found');
   res.type('html').send(`
     <html><body style="font-family: system-ui; max-width:680px; margin:24px auto;">
       <h1>Generar link (simple)</h1>
       <form method="POST" action="/admin/new">
+        <label>Dominio propio (ej: midominio.com): <input name="custom_domain" placeholder="midominio.com"/></label><br/><br/>
         <label>Slug (id): <input name="slug" required pattern="[-A-Za-z0-9_]{3,}"/></label><br/><br/>
         <label>Nombre visible: <input name="display_name" required /></label><br/><br/>
         <label>Subtitle: <input name="subtitle" /></label><br/><br/>
@@ -346,13 +369,13 @@ app.get('/admin/new', (_req, res) => {
         <label>Campo destino:
           <select name="field">
             <option value="instagram">instagram</option>
-            <option value="onlyfans">onlyfans</option>
+            <option value="onlyfans" selected>onlyfans</option>
             <option value="tiktok">tiktok</option>
           </select>
         </label><br/><br/>
         <label>Tipo de enlace público:</label>
-        <label><input type="radio" name="link_mode" value="landing" checked/> Landing (/searchEngine/slug)</label>
-        <label><input type="radio" name="link_mode" value="instructions"/> Solo instrucciones (/instructions/slug)</label><br/><br/>
+        <label><input type="radio" name="link_mode" value="landing" checked/> Landing</label>
+        <label><input type="radio" name="link_mode" value="instructions"/> Solo instrucciones</label><br/><br/>
         <label>URL foto (si ya subiste por /admin/upload-photo): <input name="photo" placeholder="https://..."/></label><br/><br/>
         <button type="submit">Crear</button>
       </form>
@@ -362,32 +385,31 @@ app.get('/admin/new', (_req, res) => {
 });
 
 app.post('/admin/new', async (req, res) => {
+  if (!isAdminHost(req)) return res.status(404).send('Not found');
   try {
-    const slug        = String(req.body.slug || '').trim();
-    const displayName = String(req.body.display_name || '').trim();
-    const subtitle    = String(req.body.subtitle || '').trim();
-    const instagram   = String(req.body.instagram || '').trim() || null;
-    const onlyfans    = String(req.body.onlyfans  || '').trim() || null;
-    const tiktok      = String(req.body.tiktok    || '').trim() || null;
-    const field       = String(req.body.field || DEFAULT_LINK_FIELD).toLowerCase();
-    const linkMode    = String(req.body.link_mode || 'landing'); // landing | instructions
-    const photoUrl    = String(req.body.photo || '').trim() || null;
+    const slug          = String(req.body.slug || '').trim();
+    const displayName   = String(req.body.display_name || '').trim();
+    const subtitle      = String(req.body.subtitle || '').trim();
+    const instagram     = String(req.body.instagram || '').trim() || null;
+    const onlyfans      = String(req.body.onlyfans  || '').trim() || null;
+    const tiktok        = String(req.body.tiktok    || '').trim() || null;
+    const field         = String(req.body.field || DEFAULT_LINK_FIELD).toLowerCase();
+    const linkMode      = String(req.body.link_mode || 'landing'); // 'landing' | 'instructions'
+    const photoUrl      = String(req.body.photo || '').trim() || null;
+    const customDomain  = String(req.body.custom_domain || '').trim() || null;
 
-    if (!/^[-A-Za-z0-9_]{3,}$/.test(slug)) {
-      return res.status(400).send('Slug inválido (mín 3, alfanumérico, _ o -)');
-    }
+    if (!/^[-A-Za-z0-9_]{3,}$/.test(slug)) return res.status(400).send('Slug inválido');
     if (!displayName) return res.status(400).send('name requerido');
-    if (!ALLOWED_FIELDS.has(field)) {
-      return res.status(400).send('Campo destino inválido');
-    }
-    if (!['landing','instructions'].includes(linkMode)) {
-      return res.status(400).send('link_mode inválido');
-    }
+    if (!ALLOWED_FIELDS.has(field)) return res.status(400).send('Campo destino inválido');
+    if (!['landing','instructions'].includes(linkMode)) return res.status(400).send('link_mode inválido');
     for (const u of [instagram, onlyfans, tiktok, photoUrl]) {
       if (u && !isSafeHttpUrl(u)) return res.status(400).send(`URL inválida: ${u}`);
     }
+    if (customDomain && !isValidDomain(customDomain)) {
+      return res.status(400).send('Dominio inválido. Ejemplo: midominio.com');
+    }
 
-    const publicUrl = computePublicUrlFromMode(slug, linkMode);
+    const publicUrl = computePublicUrl(slug, linkMode, customDomain);
 
     const insertObj = {
       id: slug,
@@ -397,23 +419,25 @@ app.post('/admin/new', async (req, res) => {
       onlyfans,
       tiktok,
       photo: photoUrl,
-      public_url: publicUrl // se guarda con BASE_PUBLIC_URL
+      domain: customDomain || null,
+      mode: linkMode,
+      public_url: publicUrl
     };
 
-    const { error } = await supabase
-      .from('links')
-      .upsert(insertObj, { onConflict: 'id' });
-
+    const { error } = await supabase.from('links').upsert(insertObj, { onConflict: 'id' });
     if (error) {
       console.error('Error upsert links:', error.message);
       return res.status(500).send('No se pudo guardar el link');
     }
 
     linksCache.delete(slug);
+    if (customDomain) domainCache.delete(normalizeHost(customDomain));
 
     res.type('html').send(`
       <html><body style="font-family: system-ui; max-width:680px; margin:24px auto;">
         <h1>Creado ✅</h1>
+        <p><b>Dominio:</b> ${customDomain || '(BASE_PUBLIC_URL)'}</p>
+        <p><b>Modo:</b> ${linkMode}</p>
         <p><b>Slug:</b> ${slug}</p>
         <p><b>Nombre:</b> ${displayName}</p>
         <p><b>Subtitle:</b> ${subtitle || ''}</p>
@@ -435,11 +459,12 @@ app.post('/admin/new', async (req, res) => {
   }
 });
 
-// Listado simple
-app.get('/admin/list', async (_req, res) => {
+// Listado
+app.get('/admin/list', async (req, res) => {
+  if (!isAdminHost(req)) return res.status(404).send('Not found');
   const { data, error } = await supabase
     .from('links')
-    .select('id,name,instagram,onlyfans,tiktok,public_url,photo,subtitle')
+    .select('id,name,subtitle,instagram,onlyfans,tiktok,photo,domain,mode,public_url')
     .order('id');
 
   if (error) return res.status(500).send('Error listando');
@@ -453,6 +478,8 @@ app.get('/admin/list', async (_req, res) => {
       <td>${r.onlyfans || ''}</td>
       <td>${r.tiktok || ''}</td>
       <td>${r.photo ? `<a href="${r.photo}" target="_blank">foto</a>` : ''}</td>
+      <td>${r.domain || ''}</td>
+      <td>${r.mode || ''}</td>
       <td>${r.public_url ? `<a href="${r.public_url}" target="_blank">${r.public_url}</a>` : ''}</td>
     </tr>`).join('');
 
@@ -462,7 +489,7 @@ app.get('/admin/list', async (_req, res) => {
       <p><a href="/admin/new">Crear nuevo</a></p>
       <table border="1" cellspacing="0" cellpadding="6">
         <thead><tr>
-          <th>id (slug)</th><th>name</th><th>subtitle</th><th>instagram</th><th>onlyfans</th><th>tiktok</th><th>photo</th><th>public_url</th>
+          <th>id (slug)</th><th>name</th><th>subtitle</th><th>instagram</th><th>onlyfans</th><th>tiktok</th><th>photo</th><th>domain</th><th>mode</th><th>public_url</th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>
@@ -484,19 +511,22 @@ app.post('/api/links', async (req, res) => {
       tiktok,
       link_mode = 'landing', // 'landing' | 'instructions'
       photo,                 // URL pública (opcional)
+      custom_domain          // dominio propio (ej: midominio.com)
     } = req.body || {};
 
     const id = String(slug || '').trim();
     if (!/^[-A-Za-z0-9_]{3,}$/.test(id)) return res.status(400).json({ error: 'Slug inválido' });
     if (!display_name) return res.status(400).json({ error: 'name requerido' });
-    if (!['landing','instructions'].includes(link_mode)) {
-      return res.status(400).json({ error: 'link_mode inválido' });
-    }
+    if (!['landing','instructions'].includes(link_mode)) return res.status(400).json({ error: 'link_mode inválido' });
+
     for (const u of [instagram, onlyfans, tiktok, photo]) {
       if (u && !isSafeHttpUrl(String(u))) return res.status(400).json({ error: `URL inválida: ${u}` });
     }
+    if (custom_domain && !isValidDomain(custom_domain)) {
+      return res.status(400).json({ error: 'Dominio inválido. Ejemplo: midominio.com' });
+    }
 
-    const publicUrl = computePublicUrlFromMode(id, link_mode);
+    const publicUrl = computePublicUrl(id, link_mode, custom_domain);
 
     const insertObj = {
       id,
@@ -506,6 +536,8 @@ app.post('/api/links', async (req, res) => {
       onlyfans: onlyfans || null,
       tiktok: tiktok || null,
       photo: photo || null,
+      domain: custom_domain || null,
+      mode: link_mode,
       public_url: publicUrl
     };
 
@@ -517,20 +549,53 @@ app.post('/api/links', async (req, res) => {
     if (error) return res.status(500).json({ error: 'No se pudo guardar', detail: error.message });
 
     linksCache.delete(id);
+    if (custom_domain) domainCache.delete(normalizeHost(custom_domain));
 
-    res.json({
-      ok: true,
-      record: data || insertObj,
-      public_url: publicUrl
-    });
+    res.json({ ok: true, record: data || insertObj, public_url: publicUrl });
   } catch (e) {
     return res.status(500).json({ error: 'Error interno', detail: e?.message });
   }
 });
 
 // ───────────────────────────────────────────────────────────
-// SLUG router: compat → redirige a /searchEngine/<slug>
-// (NO escribe en DB)
+// Enrutamiento por dominio propio (sin mostrar rutas)
+// ───────────────────────────────────────────────────────────
+// Cualquier GET a la raíz de un dominio asignado a un link renderiza la vista
+// correcta (searchEngine/instructions) sin cambiar la URL.
+app.get(['/', '/index.html'], async (req, res, next) => {
+  const host = normalizeHost(req.headers.host);
+  // Si es el host del panel admin (si se configuró), no interceptar
+  if (ADMIN_HOST && host === normalizeHost(ADMIN_HOST)) return next();
+
+  const link = await getLinkRowByDomain(host);
+  if (!link) {
+    // Host no reconocido → muestra Admin si no hay ADMIN_HOST, o 404 si está restringido
+    if (!ADMIN_HOST) return res.redirect(302, '/private-link');
+    return res.status(404).send('Not found');
+  }
+  const id = link.id;
+  if (link.mode === 'instructions') return res.render('instructions', { id });
+  return res.render('searchEngine', { id, model: link });
+});
+
+// Rutas "opacas" dentro del dominio del modelo
+app.get(['/secret', '/secret/'], async (req, res) => {
+  const host = normalizeHost(req.headers.host);
+  if (ADMIN_HOST && host === normalizeHost(ADMIN_HOST)) return res.status(404).send('Not found');
+  const link = await getLinkRowByDomain(host);
+  if (!link) return res.status(404).send('Invalid link');
+  return res.redirect(link.onlyfans || '/');
+});
+app.get(['/loading', '/loading/'], async (req, res) => {
+  const host = normalizeHost(req.headers.host);
+  if (ADMIN_HOST && host === normalizeHost(ADMIN_HOST)) return res.status(404).send('Not found');
+  const link = await getLinkRowByDomain(host);
+  if (!link) return res.status(404).send('Invalid link');
+  return res.render('loading', { id: link.id });
+});
+
+// ───────────────────────────────────────────────────────────
+// Compat: rutas clásicas por slug (en BASE_PUBLIC_URL)
 // ───────────────────────────────────────────────────────────
 const RESERVED_PREFIXES = new Set([
   'clook', 'ping', 'c', 'instructions', 'searchengine', 'loading', 'secret',
@@ -538,54 +603,41 @@ const RESERVED_PREFIXES = new Set([
 ]);
 function looksLikeSlug(s) { return /^[-A-Za-z0-9_]{3,}$/.test(s); }
 
+app.get('/instructions/:id', async (req, res) => {
+  const id = req.params.id;
+  return res.render('instructions', { id });
+});
+app.get('/searchEngine/:id', async (req, res) => {
+  const id    = req.params.id;
+  const model = await getLinkRowById(id);
+  if (!model) return res.status(404).send("Invalid link");
+  return res.render('searchEngine', { id, model });
+});
+app.get('/loading/:id', async (req, res) => {
+  const id    = req.params.id;
+  const model = await getLinkRowById(id);
+  if (!model) return res.status(404).send("Invalid link");
+  return res.render('loading', { id });
+});
+app.get('/secret/:id', async (req, res) => {
+  const id    = req.params.id;
+  const model = await getLinkRowById(id);
+  if (!model) return res.status(404).send("Invalid link");
+  return res.redirect(model.onlyfans || '/');
+});
+
+// Captura /:slug → compat
 app.get('/:slug', async (req, res, next) => {
   try {
     const slug = (req.params.slug || '').trim();
     const low  = slug.toLowerCase();
     if (RESERVED_PREFIXES.has(low)) return next();
     if (!looksLikeSlug(slug))       return next();
-
     return res.redirect(302, `/searchEngine/${slug}`);
   } catch (e) {
     console.error('Error en slug router:', e?.message || e);
     return res.status(500).send('Error interno');
   }
-});
-
-// ───────────────────────────────────────────────────────────
-// Rutas de vistas
-// ───────────────────────────────────────────────────────────
-
-// La raíz SIEMPRE muestra la página de administración (private-link)
-app.get("/", (_req, res) => {
-  return res.redirect(302, '/private-link');
-});
-
-// Renderiza instrucciones tal cual (sin redirigir)
-app.get('/instructions/:id', async (req, res) => {
-  const id = req.params.id;
-  return res.render('instructions', { id });
-});
-
-app.get('/searchEngine/:id', async (req, res) => {
-  const id    = req.params.id;
-  const model = await getLinkRow(id);
-  if (!model) return res.status(404).send("Invalid link");
-  return res.render('searchEngine', { id, model });
-});
-
-app.get('/loading/:id', async (req, res) => {
-  const id    = req.params.id;
-  const model = await getLinkRow(id);
-  if (!model) return res.status(404).send("Invalid link");
-  return res.render('loading', { id });
-});
-
-app.get('/secret/:id', async (req, res) => {
-  const id    = req.params.id;
-  const model = await getLinkRow(id);
-  if (!model) return res.status(404).send("Invalid link");
-  return res.redirect(model.onlyfans || '/');
 });
 
 // Health
@@ -594,5 +646,5 @@ app.get('/ping', (req, res) => res.status(200).send('pong'));
 // ───────────────────────────────────────────────────────────
 app.listen(port, () => {
   console.log(`Server running on http://127.0.0.1:${port}`);
-  console.log(`Admin UI available at → http://127.0.0.1:${port}/private-link`);
+  console.log(`Admin UI → http://127.0.0.1:${port}/private-link`);
 });

@@ -7,28 +7,25 @@
   <style>
     :root { --bg:#0b0f14; --card:#121822; --muted:#8fa3b0; --accent:#39c0ff; --txt:#e7f0f7; }
     *{box-sizing:border-box}
-    body{margin:0;background:var(--bg);color:var(--txt);font:16px system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, "Apple Color Emoji","Segoe UI Emoji"}
-    .wrap{max-width:780px;margin:40px auto;padding:24px}
-    .card{background:linear-gradient(180deg, #162131, #0f1520 120%);border:1px solid #1e2a3a;border-radius:16px;padding:20px;box-shadow:0 10px 40px rgba(0,0,0,.35)}
+    body{margin:0;background:var(--bg);color:var(--txt);font:16px system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,Arial}
+    .wrap{max-width:740px;margin:40px auto;padding:24px}
+    .card{background:linear-gradient(180deg,#162131,#0f1520 120%);border:1px solid #1e2a3a;border-radius:16px;padding:20px;box-shadow:0 10px 40px rgba(0,0,0,.35)}
     h1{margin:0 0 8px;font-size:22px;letter-spacing:.2px}
     p.hint{margin:0 0 20px;color:var(--muted)}
     label{display:block;margin:14px 0 6px;font-weight:600}
     input,button,select{font:inherit}
-    input[type=text], input[type=url]{width:100%;padding:12px 14px;border-radius:12px;background:#0c121c;border:1px solid #1c2736;color:var(--txt);outline:0}
-    input[type=file]{width:100%}
-    input[type=text]:focus, input[type=url]:focus{border-color:#28425d;box-shadow:0 0 0 3px rgba(57,192,255,.15)}
+    input[type=text],input[type=url],select{width:100%;padding:12px 14px;border-radius:12px;background:#0c121c;border:1px solid #1c2736;color:var(--txt);outline:0}
+    input:focus,select:focus{border-color:#28425d;box-shadow:0 0 0 3px rgba(57,192,255,.15)}
     .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
     .actions{margin-top:18px;display:flex;gap:10px;flex-wrap:wrap}
     .btn{padding:10px 14px;border-radius:12px;border:1px solid #224660;background:#112233;color:#dff2ff;cursor:pointer}
-    .btn.primary{background:linear-gradient(180deg, #2274ff, #1555c8);border-color:#1a55d5}
+    .btn.primary{background:linear-gradient(180deg,#2274ff,#1555c8);border-color:#1a55d5}
     .btn.ghost{background:transparent}
     .note{margin-top:8px;color:#92a7b7;font-size:13px}
-    /* Modal */
     .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;padding:24px}
-    .modal{background:#0f1520;border:1px solid #1d293a;border-radius:16px;max-width:620px;width:100%;padding:18px 18px}
+    .modal{background:#0f1520;border:1px solid #1d293a;border-radius:16px;max-width:520px;width:100%;padding:18px}
     .modal h2{margin:0 0 10px;font-size:20px}
-    .modal .out{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace;background:#0b111b;border:1px dashed #24405b;border-radius:12px;padding:12px;word-break:break-all}
-    .modal .actions{justify-content:flex-end}
+    .modal .out{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;background:#0b111b;border:1px dashed #24405b;border-radius:12px;padding:12px;word-break:break-all}
     .warn{color:#ffd479}
     .muted{color:#9fb1bf}
     .sep{height:1px;background:#1a2533;margin:14px 0}
@@ -38,10 +35,13 @@
   <div class="wrap">
     <div class="card">
       <h1>Generador privado de links</h1>
-      <p class="hint">Crea un enlace que pase por <code>/searchEngine/&lt;slug&gt;</code> (landing) o solo <code>/instructions/&lt;slug&gt;</code>.</p>
+      <p class="hint">Ingresa los datos. El link público será el <strong>dominio del usuario</strong> (sin rutas visibles). El servidor renderiza <code>Landing</code> o <code>Instrucciones</code> según el modo.</p>
 
       <form id="genForm" autocomplete="off">
-        <label for="slug">Slug (ID)</label>
+        <label for="customDomain">Dominio propio (ej: midominio.com)</label>
+        <input type="text" id="customDomain" name="custom_domain" placeholder="midominio.com" />
+
+        <label for="slug">Nombre/slug interno (no se muestra en el link)</label>
         <input type="text" id="slug" name="slug" placeholder="ej: mariavictoria" required pattern="[-A-Za-z0-9_]{3,}" />
 
         <div class="row">
@@ -50,46 +50,44 @@
             <input type="text" id="displayName" name="display_name" placeholder="ej: Maria Victoria" required />
           </div>
           <div>
-            <label for="subtitle">Subtítulo (opcional)</label>
-            <input type="text" id="subtitle" name="subtitle" placeholder="ej: Bio corta" />
+            <label for="mainField">Campo principal</label>
+            <select id="mainField" name="field">
+              <option value="instagram">Instagram</option>
+              <option value="onlyfans" selected>OnlyFans</option>
+              <option value="tiktok">TikTok</option>
+            </select>
           </div>
         </div>
 
-        <div class="row">
-          <div>
-            <label for="instagram">Instagram (opcional)</label>
-            <input type="url" id="instagram" name="instagram" placeholder="https://instagram.com/usuario" />
-          </div>
-          <div>
-            <label for="tiktok">TikTok (opcional)</label>
-            <input type="url" id="tiktok" name="tiktok" placeholder="https://tiktok.com/@usuario" />
-          </div>
-        </div>
+        <label for="subtitle">Subtítulo (opcional)</label>
+        <input type="text" id="subtitle" name="subtitle" placeholder="ej: Modelo Colombia" />
 
-        <label for="onlyfans">OnlyFans (requerido si eliges Landing)</label>
+        <label for="instagram">Instagram (opcional)</label>
+        <input type="url" id="instagram" name="instagram" placeholder="https://instagram.com/usuario" />
+
+        <label for="onlyfans">OnlyFans (opcional)</label>
         <input type="url" id="onlyfans" name="onlyfans" placeholder="https://onlyfans.com/usuario" />
 
-        <div class="row">
-          <div>
-            <label>Tipo de enlace público</label>
-            <div>
-              <label><input type="radio" name="link_mode" value="landing" checked /> Landing (/searchEngine/slug → redirige a OnlyFans)</label><br/>
-              <label><input type="radio" name="link_mode" value="instructions" /> Solo instrucciones (/instructions/slug)</label>
-            </div>
-          </div>
-          <div>
-            <label for="photo">Foto (sube al guardar)</label>
-            <input type="file" id="photo" accept="image/*" />
-          </div>
+        <label for="tiktok">TikTok (opcional)</label>
+        <input type="url" id="tiktok" name="tiktok" placeholder="https://www.tiktok.com/@usuario" />
+
+        <label for="photo">Foto (opcional - se sube al guardar)</label>
+        <input type="file" id="photo" accept="image/*" />
+
+        <label>Tipo de enlace público</label>
+        <div>
+          <label><input type="radio" name="link_mode" value="landing" checked /> Landing</label>
+          <label><input type="radio" name="link_mode" value="instructions" /> Solo instrucciones</label>
         </div>
 
         <div class="actions">
           <button type="submit" class="btn primary">Guardar y generar</button>
           <button type="reset" class="btn ghost">Limpiar</button>
         </div>
+        <p class="note">Si no indicas dominio, se usará la BASE_PUBLIC_URL del servidor (tendrá rutas clásicas).</p>
 
         <div class="sep"></div>
-        <p class="note">Se guardará en <code>public.links</code> con el <code>public_url</code> correcto usando tu base actual (<code>http://127.0.0.1:3000</code> en local).</p>
+        <p class="muted">La foto se sube por backend al bucket y se guarda el URL público.</p>
       </form>
     </div>
   </div>
@@ -98,17 +96,17 @@
   <div class="modal-backdrop" id="modalBackdrop" role="dialog" aria-modal="true" aria-labelledby="mTitle">
     <div class="modal">
       <h2 id="mTitle">Link generado</h2>
-      <p class="muted">Copia y comparte este enlace (pasa por la app):</p>
-      <div class="out" id="modalLinkText">http://127.0.0.1:3000/searchEngine/slug</div>
-      <div class="actions">
+      <p class="muted">Comparte este enlace:</p>
+      <div class="out" id="modalLinkText">dominio.com</div>
+      <div class="actions" style="justify-content:flex-end;margin-top:12px">
         <button class="btn" id="copyBtn">Copiar</button>
         <a class="btn primary" id="openBtn" href="#" target="_blank" rel="noopener">Abrir</a>
         <button class="btn ghost" id="closeBtn">Cerrar</button>
       </div>
-      <p class="note"><span class="warn">Nota:</span> el flujo landing terminará redirigiendo a <b>OnlyFans</b>.</p>
+      <p class="note"><span class="warn">Nota:</span> en la base se guardan <code>domain</code>, <code>mode</code>, <code>public_url</code> y el resto de campos.</p>
     </div>
   </div>
 
-  <script type="module" src="/private/private-link.js"></script>
+  <script type="module" src="./private-link.js"></script>
 </body>
 </html>
